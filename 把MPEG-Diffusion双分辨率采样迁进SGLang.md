@@ -640,3 +640,179 @@ index_copy_(): Number of indices (13024) should be equal to source.size(dim) (13
 2. **再往上游数 NaN / 查极值**（NaN 会一路传到 VAE，表现成「均匀灰」，很像数值太小）；
 3. **最后查索引语义**（同一概念的两套视图、padding、栅格顺序）；
 4. 每一步都保留一个「恒等/全覆盖」的对照实验——它们能把「数学错」和「接线错」分开。
+
+---
+
+## 附录 D：原始日志（已脱敏）
+
+只保留与结论直接相关的行；主机名、内部路径、请求 ID、端口均已替换为占位符，时间戳保留以体现真实运行顺序。
+
+### D.1 分段计时（会骗人的那一版）
+
+```
+[t] [TextEncodingStage]        finished in 2.3513 seconds
+[t] [VisualEncodingStage]      finished in 2.2202 seconds
+[t] [LatentPreparationStage]   finished in 0.0221 seconds
+minimax_h3 denoise:  17%|██▋   | 1/6 [00:14<01:10, 14.09s/it]
+minimax_h3 denoise:  33%|███▎  | 2/6 [00:39<01:21, 20.49s/it]
+minimax_h3 denoise:  50%|█████ | 3/6 [01:04<01:07, 22.56s/it]
+minimax_h3 denoise:  67%|████▋ | 4/6 [01:29<00:47, 23.54s/it]
+minimax_h3 denoise:  83%|█████▎| 5/6 [01:54<00:24, 24.10s/it]
+minimax_h3 denoise: 100%|█████ | 6/6 [02:19<00:00, 23.21s/it]
+[t] [DenoisingStage]           finished in 139.5050 seconds
+[t] [DecodingStage]            finished in 8.0956 seconds
+[t] Pixel data generated successfully in 163.85 seconds
+[t] Peak memory usage: 55656.00 MB
+```
+
+`14 → 20 → 22.6 → 23.5 → 24.1 → 23.2 s/it` 看着像降频，其实是累计平均在收敛。
+
+### D.2 同一请求的 `perf_dump`（步级）
+
+```json
+"denoise_steps_ms": [14019.88, 24971.36, 25021.34, 25048.43, 25077.41, 25043.73]
+```
+
+第 0 步 14.0 秒是 CPU 抢跑的假象；trace 显示每步都是 24.87 秒。
+
+### D.3 profiler 聚合（全程 top kernel，节选）
+
+```
+events=2292645 kernels=68927
+gpu_span_s=161.23
+
+=== STAGE scopes (cpu wall) ===
+TextEncodingStage                    0.61 s
+VisualEncodingStage                  2.31 s
+DenoisingStage                     150.59 s
+DecodingStage                        8.13 s
+
+=== GPU kernel time attributed to each stage ===
+VisualEncodingStage      wall=   2.31s  gpu=   2.19s  n= 45208  util= 95.0%
+DenoisingStage           wall= 150.59s  gpu= 150.30s  n= 13349  util= 99.8%
+DecodingStage            wall=   8.13s  gpu=   7.92s  n= 10363  util= 97.4%
+TOTAL                                   kernel= 160.42s
+
+=== top kernels, whole trace ===
+   96.410 s  60.1%  n=    302  FlashAttnFwdSm80<...>
+   16.529 s  10.3%  n=   2123  ampere_sgemm_128x64_tn
+   16.054 s  10.0%  n=   1209  cutlass::Kernel2<... signed char ...>
+    5.459 s   3.4%  n=    906  ampere_sgemm_32x128_tn
+    3.600 s   2.2%  n=   1200  unrolled_elementwise_kernel<CUDAFunctor_add<float>>
+    2.813 s   1.8%  n=    604  ncclDevKernel_AllReduce_Sum_bf16_RING_LL
+    2.399 s   1.5%  n=   1225  unrolled_elementwise_kernel<direct_copy>
+    2.066 s   1.3%  n=    900  elementwise_kernel<gpu_kernel_impl<add<float>>>
+    1.833 s   1.1%  n=    907  quantize_int8_rowwise_convrot64_kernel<bf16,256>
+    0.994 s   0.6%  n=    324  cudnn_generated_fort_native_sdpa_sm80_...
+```
+
+### D.4 每步归因（按 50 次 attention 调用切窗）
+
+```
+attention calls inside denoise: 302 (50 layers/step expected)
+step 0: span= 23.95s kernel= 23.93s n= 2163 attention= 15.42s (64.5%)
+step 1: span= 24.85s kernel= 24.84s n= 2159 attention= 16.06s (64.6%)
+step 2: span= 24.88s kernel= 24.87s n= 2159 attention= 16.08s (64.6%)
+...
+attention call duration, first 60 calls:
+   7.8ms   7.8ms 318.1ms 318.2ms 317.3ms 317.8ms 318.2ms 318.4ms 320.0ms 319.2ms
+ 320.6ms 321.4ms 321.9ms 321.6ms 322.4ms 322.4ms 322.1ms 321.7ms 322.5ms 322.6ms
+```
+
+前两个 7.8 ms 是极小的调用（来自参考图那一支），之后稳定在约 320 ms。
+
+### D.5 机器状态（同期）
+
+```
+index, name, clocks.sm, power.draw, temperature.gpu, utilization.gpu
+6, NVIDIA A100-SXM4-80GB, 1290-1410 MHz, 395-415 W, 56-64 C, 100 %
+7, NVIDIA A100-SXM4-80GB, 1290-1410 MHz, 390-410 W, 57-65 C, 100 %
+```
+
+### D.6 SageAttention 的对照
+
+```
+=== top kernels, whole trace (SageAttention) ===
+   87.094 s  57.0%  n=    302  qk_int_sv_f16_attn_kernel<128u,64u,32u,64u,128u,...>
+   16.462 s  10.8%  n=   2123  ampere_sgemm_128x64_tn
+   15.815 s  10.3%  n=   1209  cutlass::Kernel2<... signed char ...>
+    ...
+TOTAL kernel= 152.85s
+```
+
+```
+FA_run1 vs FA_run2 (same weights, same seed):
+PSNR y:inf  SSIM Y:1.000000
+FA_run2 vs Sage:
+PSNR y:27.195510  SSIM Y:0.838258
+per-frame psnr_avg: frame 1: 30.0 dB, frame 80: 27.9 dB, frame 158: 30.1 dB, min 27.5 dB
+```
+
+### D.7 双轨采样的运行日志
+
+```
+[minimax_h3 denoise] [two-track] steps=6 switch=3 sigma=0.800 lr_steps=3 hr_steps=3 latent=(47,84,48)
+[two-track] region head: block 25
+[two-track] switch at sigma=0.800: mask 35.7% of the frame, hr tokens=16920
+[two-track] region head picked 24.6% of the frame
+[two-track] stats: lr 0.92/4.60 hr 0.80/3.29 (absmean/max)
+[two-track] compose: inside=0.357 hr_absmean=0.285 nz=16920/47376 lr_absmean=0.895 out_absmean=0.868
+[two-track] spread: in_std=0.9808 out_std=1.1136 in_minmax=-3.29/3.18
+[two-track] timing {'lr_steps_s': 20.8, 'switch_s': 0.01, 'hr_steps_s': 44.42, 'compose_s': 0.0, 'total_s': 65.23}
+```
+
+### D.8 三个典型报错（对应第五节的坑）
+
+```
+# 坑 4：两套索引视图
+The shape of the mask [17984] at index 0 does not match the shape of the indexed tensor [9324]
+
+# 坑 5：padding 行混进 HR 分支
+index_copy_(): Number of indices (13024) should be equal to source.size(dim) (13036)
+
+# 坑 7：网格 key 全 NaN（Guard 版，附人工加的断言）
+rope positions (37296, 3) do not match rows 37296
+[two-track] attn L0: nan k_raw=0 normed=0 grid=64812 q_hr=0 pos=0 cos=0
+```
+
+### D.9 离线 runner 的三个失败（第八节）
+
+```
+# 1) 不传组件量化 → 显存不够
+_FatalDistributedForward: Multi-rank forward ran out of memory; restart the server.
+
+# 2) 缺 ninja → worker 初始化直接退出
+FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+RuntimeError: sglang-diffusionWorker-1 exited during initialization (exit code 1)
+
+# 3) --output-dir 不存在，且 --prompt 吃掉了后面的 flag
+error: unrecognized arguments: --output-dir <路径>
+```
+
+修好后的成功输出：
+
+```
+[two-track] timing {'lr_steps_s': 20.84, 'switch_s': 0.0, 'hr_steps_s': 39.19, 'compose_s': 0.0, 'total_s': 60.03}
+```
+
+### D.10 产物核验
+
+```
+h264,768,1344,6.583333,158
+aac,6.575000,207
+```
+
+```
+A=<baseline>.mp4  B=<two-track>.mp4
+md5sum: 1f25c20fd7923f3ca6fb7da2b8ce2e0d  (both)
+BYTE-IDENTICAL to pre-test FA output
+```
+
+### D.11 回退验收
+
+```
+$ curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:<port>/health
+200
+$ cmp -s <baseline>.mp4 <after-rollback>.mp4 && echo "G5 PASS: BYTE-IDENTICAL"
+G5 PASS: BYTE-IDENTICAL
+```

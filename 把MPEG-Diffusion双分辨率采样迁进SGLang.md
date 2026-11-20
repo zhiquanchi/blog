@@ -412,3 +412,231 @@ python3 -I two_track_runner.py req.json --out runs/offline \
 - **收益是真的**：同一套框架、同一批权重，双分辨率采样把 denoise 从 139.5 秒压到 59.9 秒（2.33×），端到端 2.04×，且已贴着该配置的理论上限。
 - **代价也是真的**：6 步蒸馏拿不到足够步数，唯一能补的 fine-tune 权重未公开，配套的上采样器/混合器也需要额外移植。
 - **方法本身没错**：同一批公开发布权重，在 20 步的独立渲染栈上实测 2.41×，画面可用。差异来自「步预算 + 权重 + 配套件」，不是来自算法。
+---
+
+## 附录 A：尝试时间线（含所有失败的岔路）
+
+按真实顺序记，失败的分支也留着——它们解释了为什么最终方案长这样。
+
+| # | 尝试 | 结果 | 得到什么 |
+|---|---|---|---|
+| 1 | 直接看服务日志的分段计时 | denoise 139.5 s、每步「越来越慢」15→26 s | 数字偏低、且 tqdm 是累计平均；必须先上 profiler |
+| 2 | 按请求开 torch profiler，聚合 kernel | 160.4 s kernel、attention 96.4 s（60%）、GPU 99.8% 忙 | 锁定唯一大头；排除 CUDA Graph / 文本缓存 / VAE tile |
+| 3 | 换 SageAttention（INT8 QK） | attention −9.7%，画质 27 dB 且首帧就偏 | A100 上不划算；蒸馏模型对精度敏感 |
+| 4 | 想用现成的 int8 权重直接跑参考实现 | 报 `missing config metadata` | 该权重缺配置元数据，且 key 带 `model.diffusion_model.` 前缀，参考实现的加载器只改 `.weight_scale` 后缀 |
+| 5 | `git clone` 拉参考实现 | 超时 / `HTTP2 framing layer` 错误 | 改用 release 包 + 本机中转（源站 40 KB/s → 本机 9.4 MB/s → 传回 4.9 MB/s） |
+| 6 | 从镜像下载权重（裸 `curl -r` 分块） | 拼出 0 字节文件（被 429） | 换成 hub 客户端：21 GB / 452 s（46 MB/s）、5.2 GB / 234 s |
+| 7 | 用官方 20 步设定跑参考实现 | 75.09 → 31.21 s（2.41×），画面可用 | 方法本身没问题，差异会来自「步预算 + 权重 + 配套件」 |
+| 8 | 在 `_attend` 装分发钩子（默认惰性） | 默认路径逐字节一致 | 有了零风险的上车点 |
+| 9 | 关融合 qknorm+rope 走可拦截路径 | 仍逐字节一致 | 确认可以接管 norm+RoPE |
+| 10 | 写双分辨率 attention + 5 项 parity | 全 0.0 | 数学闭环（这三个 bug 都是它抓的） |
+| 11 | 布局从已有 packed 派生 + 26 项不变量 | 全 PASS | 带参考图的条件布局也能复用 |
+| 12 | 第一次 6 步跑通 | 蒙版区一块灰、背景噪声 | 有 bug，开始二分定位 |
+| 13 | 加统计打印定位 NaN | 网格 key 里 6.4 万个 NaN | 网格用了序列的 RoPE 表（不是按位置查表） |
+| 14 | 修 `cu_seqlens` 与 `used` 越界 | 不再 illegal memory access | varlen 内核对不存在的行非常敏感 |
+| 15 | 修 `x0` 取更新前状态、收尾取阶段二的 LR | 画面连贯（背景正常、区域仍是软场） | 只剩「HR 没细节」这一个真问题 |
+| 16 | 把 switch 提前到 σ=0.973（给 HR 5 步） | 端到端 100 s，画质无本质改善 | 问题不只在步数，也在缺 fine-tune 权重与配套件 |
+| 17 | 接 region head（α=0.5） | 选中 15.7%，75 s | 打开了，但区域偏小 |
+| 18 | α 调到 0.35 | 选中 24.6%，80.2 s，PSNR 21.9 | 落在目标区间，作为最终配置 |
+| 19 | 做不依赖服务的离线入口 | 先 OOM、再 `FileNotFoundError: ninja`、再 flag 被 `--prompt` 吃掉 | 三个只属于离线路径的坑（见第八节） |
+| 20 | 回退 + 重跑同请求 | `cmp` 逐字节一致、健康检查 200 | 验收闭环 |
+
+还有两个「非代码」的坑值得记：
+
+- **服务自带的 synthetic warmup 会走同一条业务路径。** 双轨循环里抛任何异常，启动阶段的 warmup 就会失败（服务仍然会起来，但日志里全是红字），所以调试时第一眼看 warmup 而不是等用户请求。
+- **ref2va 分区会拒绝空条件**（`conditions requires at least one entry`），连 warmup 请求都带 4096 个条件行。所以「先用无条件的 t2va 简化」这条路走不通，必须一开始就支持条件行。
+
+---
+
+## 附录 B：代码改动清单
+
+### B.1 文件结构
+
+```
+<repo>/python/sglang/multimodal_gen/
+├── runtime/models/dits/
+│   ├── minimax_h3.py                     ← 改：+12 行惰性分发（原有文件）
+│   └── minimax_h3_two_track.py           ← 新：约 470 行
+└── runtime/pipelines_core/stages/model_specific_stages/minimax_h3/
+    ├── stages/denoising.py               ← 改：循环调用处套一个 flag 分支（原有文件）
+    ├── minimax_h3_two_track_loop.py      ← 新：约 430 行
+    ├── test_two_track_parity.py          ← 新：5 项数学 parity
+    └── test_two_track_layout.py          ← 新：26 项布局不变量
+```
+
+配套（不属于框架）：`two_track_runner.py`（离线入口，约 110 行）、两份 serve 脚本（生产 / 实验）、一份回退脚本、源码备份。
+
+### B.2 `_attend` 里的分发（唯一的侵入点，12 行）
+
+```python
+def _attend(self, x, q, k, v, *, rope_cache, cu_seqlens, ...):
+    total = x.shape[0]
+
+    from ...minimax_h3_two_track import (
+        capture_x_for_layer, get_two_track_context, two_track_attend,
+    )
+
+    capture_x_for_layer(self, x)          # region head 抓 block 25 的输入
+    ctx = get_two_track_context()
+    if ctx is not None and self.prefix.startswith("blocks."):
+        ctx.layer = int(self.prefix.split(".")[1])
+        return two_track_attend(
+            self, x, q, k, v,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens, cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen, ctx=ctx,
+            ulysses_active=ulysses_active, ring_active=ring_active,
+        )
+    # ↓ 原有逻辑一字未改
+```
+
+- `capture_x_for_layer` 必须在 ctx 判断**之前**：阶段一没有装 context，光靠双轨分支抓不到 region head 需要的隐状态。
+- 没装 context 时整个分支只用两次函数调用 + 一次字符串判断，对默认路径没有数值影响（逐字节验证过）。
+
+### B.3 采样循环处的 flag 分支
+
+```python
+if two_track_enabled():
+    video_rows, audio_rows = minimax_h3_two_track_loop(
+        model=model, ctx=ctx, emb=emb, tags=tags, packed=packed,
+        positive=positive, initial_video=initial_video, initial_audio=initial_audio,
+        sigmas_video=sigmas_video, sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
+        device=device, batch=batch, server_args=server_args,
+        attn_metadata=attn_metadata,
+        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+        renoise_generator=renoise_generator,
+        cond_rows=ctx.cond_rows, audio_ref_rows=ctx.audio_ref_rows,
+        on_step=on_step,
+        step_profiler=partial(self._profile_denoising_step, batch=batch),
+    )
+else:
+    video_rows, audio_rows = minimax_h3_denoise_loop(   # 原有调用，整体缩进一层
+        ...
+    )
+```
+
+函数签名刻意对齐原循环（同样返回 `(video_rows, audio_rows)`），所以后面的解码、发布逻辑完全不用改。
+
+### B.4 双分辨率 attention 的主流程
+
+```python
+@torch.no_grad()
+def two_track_attend(attn, x, q, k, v, *, rope_cache, cu_seqlens, ctx, ...):
+    cos_sin, positions = rope_cache
+    split = ctx.lr_video_stop          # LR 行结束 = HR 行开始
+    used  = ctx.used or total          # 真实行数（后面是 64 对齐 padding）
+
+    # 1) RoPE 是就地旋转：先把「旋转前」的 LR 视频 K 留一份
+    lr_raw_k = k[ctx.lr_video_start:split].clone()
+
+    # 2) LR / text / audio：走原生 dense 路径，但 cu_seqlens 收成 [0, stop, stop]
+    q_lr, k_lr = apply_qk_norm_rope(q[:split], k[:split], ..., positions[:split])
+    out[:split] = attention_core(attn, q_lr, k_lr, v[:split],
+                                 cu_seqlens=[0, split, split], ...)
+
+    # 3) HR 网格：norm(LR K) → f_up 或 copy → 排成栅格 → 覆盖 mask 内 → 用网格自己的 RoPE 表旋转
+    normed = rmsnorm(attn.k_norm, lr_raw_k)
+    grid_k = maps.expand(layer, "k", normed) if maps else expand_copy(normed)
+    grid_k = grid_k.index_select(0, cell_order)          # 先排栅格
+    grid_k = grid_k.index_copy(0, hr_index, rmsnorm(attn.k_norm, k[split:used]))  # 再覆盖
+    grid_k = rope_only(grid_k, ctx.hr_cos_sin, ctx.hr_grid_positions)
+
+    # 4) HR 查询 vs [text/audio + 整张 HR 网格]，q/kv 长度不同 → 用两个 cu_seqlens
+    q_hr = rope_only(rmsnorm(attn.q_norm, q[split:used]), cos_sin, positions[split:used])
+    out[split:used] = cross_attention(q_hr, cat([k[:video_start], grid_k]),
+                                              cat([v[:video_start], grid_v]))
+    return out
+```
+
+这段里的每一行都对应一个踩过的坑（就地旋转、栅格顺序、`used` 截断、网格自己的 RoPE 表、独立的 `cu_seqlens`）。
+
+### B.5 布局派生（不新造打包器）
+
+```python
+def build_two_track_layouts(*, packed, latent_t, latent_h, latent_w, mask, scale=2):
+    g = packed["img_position_ids"]
+    video_start = int(packed["video_pos"][0])
+    prefix, prefix_tags = g[:video_start], packed["token_tags"][:video_start]
+    origin = float(g[video_start, 0])          # 目标视频的 t 轴起点（含参考块带来的偏移）
+
+    t_vals = video_t_grid(latent_t, origin)    # 两个分辨率共用同一条 t 轴
+    lr_g = grid_block(t_vals, axis(latent_h // scale), axis(latent_w // scale))
+    hr_g = grid_block(t_vals, axis(latent_h),        axis(latent_w))   # 完整 HR 栅格
+
+    lr = pack_layout(prefix, prefix_tags, audio_pos, text_pos, lr_g,
+                     n_cond=n_cond, cond_img_pos=packed["img_pos"][:n_cond])
+    if mask is None:
+        return {"lr": lr}                       # 阶段一只需要它
+    plan = TwoTrackPlan(mask, scale)
+    tt = pack_layout(prefix, prefix_tags, audio_pos, text_pos,
+                     cat([lr_g, hr_g[plan.hr_index]]), n_cond=n_cond, ...)
+    return {"lr": lr, "tt": {**tt, "plan": plan, "lr_video_start": video_start, ...}}
+```
+
+两个容易写错的地方：`img_pos` 要**同时**包含条件行与目标行（两套语义不同的视图）；`update_mask` 的长度是「视频行数」而不是「序列长度」。
+
+### B.6 环境变量（全部默认关闭，随时可回退）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `SGLANG_H3_TWO_TRACK` | 关 | 总开关；关掉即完全走原生路径 |
+| `SGLANG_H3_TWO_TRACK_SWITCH` | 0.75 | switch 的 σ（按 σ 最近原则对齐到某一步） |
+| `SGLANG_H3_TWO_TRACK_MAPS` | 无 | `f_up` 权重；不设则退化为「复制 K/V」 |
+| `SGLANG_H3_TWO_TRACK_REGION` | 无 | region head；不设则用固定框 |
+| `SGLANG_H3_TWO_TRACK_ALPHA` | 0.5 | region head 的阈值系数 |
+
+### B.7 回退
+
+两个原有文件都留了原件备份，另有一个回退脚本（停服 → 还原 → 用原生配置重启）。整个过程中回退验证了四次，每次都是「同一请求 → `cmp` 逐字节一致 → 健康检查 200」。
+
+---
+
+## 附录 C：三个调试案例（怎么定位这类「不报错但结果不对」）
+
+这类 bug 不会抛异常，只能靠「在关键节点打统计量」。
+
+### C.1 蒙版区变成一块均匀的灰
+
+先排除「根本没写进去」：打印合成后的 `inside` 占比、非零行数、区域内外的均值与标准差。
+
+```
+compose: inside=0.357  nz=16920/47376  hr_absmean=0.285  out_absmean=0.868
+spread : in_std=0.98  out_std=1.11  in_minmax=-3.29/3.18
+```
+
+区域内有内容（std 0.98），所以不是「零」。继续往上游打：在 attention 里对 `k_raw / normed / grid / q_hr / positions / cos_sin` 分别数 NaN——
+
+```
+attn L0: nan k_raw=0 normed=0 grid=64812 q_hr=0 pos=0 cos=0
+```
+
+网格 key 有 6.4 万个 NaN。再往上一步：`positions` 的最大值是 37295——那不是归一化后的坐标，而是「表的行号」。于是定位到：用了序列的 RoPE 表去索引网格位置。修法是给网格单独 `build_rope_cache`，把 `(cos_sin, positions)` 成对存进 context。
+
+> 关键认知：这里的 RoPE 表是「每个序列行对应的旋转」，不是「按位置查表」。两套东西长得很像，混用只会在「另一种分辨率」上炸。
+
+### C.2 形状不匹配里的「两个视图」
+
+```
+mask [17984] vs tensor [9324]
+```
+
+17984 与 9324 的差是 8×——很像是「序列长度」对「视频行数」。再一查：条件行在打包序列里位于 text 之后、audio 之前，而在「视频行」数组里位于最前面。同一个东西有两套索引，任何一处混用都会错位。
+
+修法：布局里显式生成两套——`img_pos` 用打包行号、`update_mask` 用视频行序号，并在派生函数里加断言。
+
+### C.3 「差 12 行」的越界
+
+```
+index_copy_(): Number of indices (13024) should be equal to source.size(dim) (13036)
+```
+
+差 12，正好是 64 对齐产生的 padding 行。根因是所有行区间用 `seq_len` 而不是 `used` 截断，padding 行被当成 HR 行参与了 attention 与索引。
+
+修法：`ctx.used` 一路传下去；padding 行的输出显式置零。
+
+### C.4 小结：调试顺序
+
+1. **先证伪「没写进去」**（占比、非零行数、均值/方差）；
+2. **再往上游数 NaN / 查极值**（NaN 会一路传到 VAE，表现成「均匀灰」，很像数值太小）；
+3. **最后查索引语义**（同一概念的两套视图、padding、栅格顺序）；
+4. 每一步都保留一个「恒等/全覆盖」的对照实验——它们能把「数学错」和「接线错」分开。
